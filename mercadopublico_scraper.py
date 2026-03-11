@@ -158,10 +158,16 @@ class MercadoPublicoScraper:
         data = {}
 
         # ── ID Licitación ──────────────────────────────────────────────────────
+        # HTML: <strong>ID Licitación:</strong><span class="clearfix"> 425-63-LR25</span>
+        # Usamos span.clearfix para no incluir el label del <strong>
         id_div = card.find("div", class_="id-licitacion")
         if id_div:
-            span = id_div.find("span")
-            data["id_licitacion"] = span.get_text(strip=True) if span else ""
+            span_clearfix = id_div.find("span", class_="clearfix")
+            if span_clearfix:
+                data["id_licitacion"] = span_clearfix.get_text(strip=True)
+            else:
+                texto = id_div.get_text(strip=True)
+                data["id_licitacion"] = re.sub(r"^ID\s*Licitaci[oó]n\s*:?\s*", "", texto, flags=re.I)
         else:
             data["id_licitacion"] = ""
 
@@ -254,16 +260,35 @@ class MercadoPublicoScraper:
 
         return data
 
+    def _esperar_cambio_pagina(self, pagina_esperada: int, timeout: int = 30) -> bool:
+        """
+        Espera hasta que el paginador muestre pagina_esperada en el <li class="current">.
+        Evita scrapear la misma página dos veces cuando la carga es lenta.
+        """
+        for _ in range(timeout):
+            soup = BeautifulSoup(self.driver.page_source, "html.parser")
+            paginador = soup.find("div", class_="paginador")
+            if paginador:
+                current_li = paginador.find("li", class_="current")
+                if current_li:
+                    try:
+                        if int(current_li.get_text(strip=True)) == pagina_esperada:
+                            return True
+                    except ValueError:
+                        pass
+            sleep(1)
+        logger.warning(f"   ⚠️  Timeout esperando página {pagina_esperada} en el paginador")
+        return False
+
     def _scrapear_pagina_actual(self) -> list:
         """Parsea todas las tarjetas de la página actual dentro del iframe."""
-        sleep(2)  # Esperar que carguen los resultados
         html = self.driver.page_source
         soup = BeautifulSoup(html, "html.parser")
         cards = soup.find_all("div", class_="lic-bloq-wrap")
         logger.info(f"   📦 Tarjetas encontradas en esta página: {len(cards)}")
         return [self._parsear_tarjeta(c) for c in cards]
 
-    def _obtener_info_paginacion(self) -> tuple[int, int]:
+    def _obtener_info_paginacion(self) -> tuple[int, int, bool]:
         """
         Lee el paginador y devuelve (pagina_actual, ultima_pagina).
         El paginador tiene:
@@ -278,45 +303,50 @@ class MercadoPublicoScraper:
         if not paginador:
             return 1, 1
 
-        # Página actual
+        # Página actual — es el <li class="current"> que NO está dentro de un <a>
         current_li = paginador.find("li", class_="current")
         try:
             pagina_actual = int(current_li.get_text(strip=True))
         except (AttributeError, ValueError):
             pagina_actual = 1
 
-        # Última página: máximo número entre todos los onclick="$.Busqueda.buscar(N)"
+        # Última página: máximo número en los <a> que NO sean el next-pager
+        # El next-pager tiene onclick="$.Busqueda.buscar(pagina_actual+1)" pero NO
+        # representa la última página — hay que excluirlo
         numeros = []
         for a in paginador.find_all("a", onclick=True):
+            # Saltar el next-pager
+            if "next-pager" in (a.get("class") or []):
+                continue
             match = re.search(r"buscar\((\d+)\)", a["onclick"])
             if match:
                 numeros.append(int(match.group(1)))
 
-        ultima_pagina = max(numeros) if numeros else pagina_actual
+        # Si el next-pager existe, hay al menos una página más allá de las visibles
+        next_pager = paginador.find("a", class_="next-pager")
+        if next_pager and numeros:
+            # El next-pager apunta a pagina_actual+1, pero puede haber más.
+            # Usamos max(numeros) como mínimo conocido; el loop seguirá
+            # mientras next-pager exista O pagina_actual < ultima_pagina_conocida.
+            ultima_pagina = max(numeros)
+        elif numeros:
+            ultima_pagina = max(numeros)
+        else:
+            ultima_pagina = pagina_actual
 
-        return pagina_actual, ultima_pagina
+        hay_mas = next_pager is not None
+        return pagina_actual, ultima_pagina, hay_mas
 
     def _ir_siguiente_pagina(self, pagina_actual: int) -> bool:
         """
-        Ejecuta $.Busqueda.buscar(pagina_actual + 1) via JS en el iframe.
-        Retorna True si avanzó, False si ya era la última página.
+        Ejecuta $.Busqueda.buscar(pagina_actual + 1) via JS.
+        La condición de fin la controla el loop comparando pagina_actual >= ultima_pagina.
         """
         pagina_sig = pagina_actual + 1
-
-        # Verificar que existe el enlace a la siguiente página en el DOM
-        try:
-            # Buscar el <a class="next-pager"> — indica que hay página siguiente
-            next_btn = self.driver.find_element(By.CSS_SELECTOR, "a.next-pager")
-            if not next_btn.is_displayed():
-                logger.info("   🏁 No hay más páginas (next-pager oculto)")
-                return False
-        except NoSuchElementException:
-            logger.info("   🏁 No hay más páginas (next-pager ausente)")
-            return False
-
         logger.info(f"   ➡️  Yendo a página {pagina_sig} via $.Busqueda.buscar({pagina_sig})...")
         self.driver.execute_script(f"$.Busqueda.buscar({pagina_sig});")
-        sleep(3)
+        if not self._esperar_cambio_pagina(pagina_sig, timeout=30):
+            logger.warning(f"   ⚠️  La página no cambió a {pagina_sig} — continuando igual")
         return True
 
     # ── Flujo principal ────────────────────────────────────────────────────────
@@ -374,21 +404,38 @@ class MercadoPublicoScraper:
 
         # ── 6. Botón Buscar ────────────────────────────────────────────────────
         logger.info("🔍 Ejecutando búsqueda...")
+        # IMPORTANTE: NO usar //*[contains(@onclick,'Busqueda.buscar')] porque
+        # también matchea los links de paginación. Usamos selectores específicos
+        # y como fallback ejecutamos $.Busqueda.buscar(1) directamente por JS.
         candidatos_buscar = [
             (By.ID,    "btnBuscarLicitacion"),
             (By.XPATH, "//button[contains(.,'Buscar')]"),
-            (By.XPATH, "//a[contains(.,'Buscar')]"),
-            (By.XPATH, "//*[contains(@onclick,'Busqueda.buscar')]"),
+            (By.XPATH, "//a[contains(.,'Buscar') and not(contains(@class,'pager'))]"),
+            (By.XPATH, "//input[@type='submit' and contains(@value,'Buscar')]"),
         ]
+        btn_clickeado = False
         for by, selector in candidatos_buscar:
             try:
                 btn = self.driver.find_element(by, selector)
                 if btn.is_displayed():
                     self._js_click(btn)
-                    logger.info(f"   ✓ Clic en Buscar")
+                    logger.info(f"   ✓ Clic en Buscar ({selector})")
+                    btn_clickeado = True
                     break
             except NoSuchElementException:
                 continue
+
+        if not btn_clickeado:
+            # Fallback seguro: ejecutar la búsqueda directamente por JS en página 1
+            logger.info("   ℹ️  Botón no encontrado — ejecutando $.Busqueda.buscar(1) via JS")
+            try:
+                self.driver.execute_script("$.Busqueda.buscar(1);")
+                logger.info("   ✓ $.Busqueda.buscar(1) ejecutado")
+            except Exception as e:
+                logger.error(f"   ❌ Error ejecutando JS de búsqueda: {e}")
+                return []
+
+        sleep(3)  # Dar tiempo a que cargue la respuesta
 
         # ── 7. Esperar primeros resultados ─────────────────────────────────────
         logger.info("⏳ Esperando resultados (hasta 60 s)...")
@@ -405,35 +452,67 @@ class MercadoPublicoScraper:
         todas_licitaciones = []
 
         while True:
-            # Leer estado actual del paginador
-            pagina_actual, ultima_pagina = self._obtener_info_paginacion()
-            logger.info(f"\n📄 Scrapeando página {pagina_actual} de {ultima_pagina}...")
+            pagina_actual, ultima_pagina, hay_mas = self._obtener_info_paginacion()
+            logger.info(f"\n📄 Scrapeando página {pagina_actual} (última conocida: {ultima_pagina}, hay_mas: {hay_mas})...")
 
             licitaciones_pagina = self._scrapear_pagina_actual()
             todas_licitaciones.extend(licitaciones_pagina)
             logger.info(f"   ✅ Total acumulado: {len(todas_licitaciones)} licitaciones")
 
-            # Salir si ya estamos en la última página
-            if pagina_actual >= ultima_pagina:
+            # Fin: no hay next-pager Y ya estamos en la última página visible
+            if not hay_mas and pagina_actual >= ultima_pagina:
                 logger.info("   🏁 Última página alcanzada")
                 break
 
-            if not self._ir_siguiente_pagina(pagina_actual):
-                break
-
-            # Esperar que cargue la nueva página
-            try:
-                self._wait(30).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "lic-bloq-wrap"))
-                )
-            except TimeoutException:
-                logger.warning("⚠️  Timeout esperando tarjetas en nueva página — deteniendo")
-                break
+            self._ir_siguiente_pagina(pagina_actual)
 
         logger.info(f"\n🎯 Scraping finalizado. Total: {len(todas_licitaciones)} licitaciones")
         return todas_licitaciones
 
-    # ── Guardar JSON ───────────────────────────────────────────────────────────
+    # ── Guardar Excel ──────────────────────────────────────────────────────────
+    def guardar_excel(self, datos: list, fecha_inicio: datetime, fecha_fin: datetime) -> str:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        # Nombre: LICIT_CHILE_AAMMDD.xlsx usando fecha_inicio
+        fecha_str = fecha_inicio.strftime("%y%m%d")
+        nombre = f"LICIT_CHILE_{fecha_str}.xlsx"
+        ruta = self.output_dir / nombre
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Licitaciones"
+
+        columnas = [
+            ("ID Licitación",      "id_licitacion"),
+            ("Tipo",               "tipo"),
+            ("Estado",             "estado"),
+            ("Título",             "titulo"),
+            ("Descripción",        "descripcion"),
+            ("Monto",              "monto"),
+            ("Fecha Publicación",  "fecha_publicacion"),
+            ("Fecha Cierre",       "fecha_cierre"),
+            ("Entidad",            "entidad"),
+            ("Compras Efectuadas", "compras_efectuadas"),
+            ("Reclamos Pago",      "reclamos_pago"),
+            ("URL Ficha",          "url_ficha"),
+        ]
+
+        # Encabezados
+        for col_idx, (header, _) in enumerate(columnas, start=1):
+            ws.cell(row=1, column=col_idx, value=header)
+
+        # Datos
+        for row_idx, item in enumerate(datos, start=2):
+            for col_idx, (_, campo) in enumerate(columnas, start=1):
+                ws.cell(row=row_idx, column=col_idx, value=item.get(campo, ""))
+
+        wb.save(str(ruta))
+        logger.info(f"💾 Excel guardado: {ruta}")
+        return str(ruta)
+
+    # ── Guardar JSON (respaldo) ────────────────────────────────────────────────
     def guardar_json(self, datos: list, fecha_inicio: datetime, fecha_fin: datetime) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         fi = fecha_inicio.strftime("%Y%m%d")
@@ -501,7 +580,7 @@ def main():
         scraper.iniciar()
         datos = scraper.scrape(fecha_inicio, fecha_fin)
         if datos:
-            ruta = scraper.guardar_json(datos, fecha_inicio, fecha_fin)
+            ruta = scraper.guardar_excel(datos, fecha_inicio, fecha_fin)
             print(f"\n✅ Listo — {len(datos)} licitaciones guardadas en:\n   {ruta}")
         else:
             print("\n⚠️  No se obtuvieron licitaciones.")
