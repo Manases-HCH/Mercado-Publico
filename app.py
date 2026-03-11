@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from mercadopublico_scraper import MercadoPublicoScraper
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -30,18 +30,12 @@ def health():
 def scrape():
     """
     Recibe fecha_inicio y fecha_fin, ejecuta el scraping de tarjetas
-    y retorna las licitaciones como JSON.
+    y retorna el Excel como archivo adjunto.
 
     Body JSON:
         {
             "fecha_inicio": "2025-02-01",
             "fecha_fin":    "2025-02-28"
-        }
-
-    Response JSON:
-        {
-            "metadata": { ... },
-            "licitaciones": [ { ... }, ... ]
         }
     """
     data = request.get_json(force=True, silent=True) or {}
@@ -60,7 +54,7 @@ def scrape():
         fecha_fin    = datetime.strptime(fecha_fin_str,    "%Y-%m-%d")
     except ValueError:
         return jsonify({
-            "error": "Formato de fecha inválido. Usa YYYY-MM-DD (ej: 2025-02-01)"
+            "error": "Formato de fecha invalido. Usa YYYY-MM-DD (ej: 2025-02-01)"
         }), 400
 
     if fecha_fin < fecha_inicio:
@@ -68,7 +62,7 @@ def scrape():
             "error": "fecha_fin debe ser igual o posterior a fecha_inicio"
         }), 400
 
-    logger.info(f"📥 /scrape — {fecha_inicio_str} → {fecha_fin_str}")
+    logger.info(f"Recibiendo /scrape — {fecha_inicio_str} a {fecha_fin_str}")
 
     # ── Ejecutar scraper ───────────────────────────────────────────────────────
     scraper = MercadoPublicoScraper(headless=True, output_dir=OUTPUT_DIR)
@@ -81,35 +75,31 @@ def scrape():
     finally:
         scraper.cerrar()
 
-    if licitaciones is None:
+    if not licitaciones:
         return jsonify({
-            "error": "El scraper no pudo completar el proceso. Revisa los logs."
-        }), 500
+            "error": "El scraper no encontro licitaciones para el rango indicado."
+        }), 404
 
-    # ── Guardar JSON en disco (respaldo) ───────────────────────────────────────
+    # ── Generar Excel ──────────────────────────────────────────────────────────
     try:
-        ruta_json = scraper.guardar_json(licitaciones, fecha_inicio, fecha_fin)
-        logger.info(f"💾 Respaldo guardado: {ruta_json}")
+        ruta_excel = scraper.guardar_excel(licitaciones, fecha_inicio, fecha_fin)
     except Exception as e:
-        logger.warning(f"⚠️  No se pudo guardar respaldo JSON: {e}")
+        logger.exception("Error generando Excel")
+        return jsonify({"error": f"Error generando Excel: {e}"}), 500
 
-    # ── Respuesta ──────────────────────────────────────────────────────────────
-    logger.info(f"✅ Retornando {len(licitaciones)} licitaciones")
+    nombre_descarga = f"LICIT_CHILE_{fecha_inicio.strftime('%y%m%d')}.xlsx"
+    logger.info(f"Enviando Excel: {ruta_excel} ({len(licitaciones)} licitaciones)")
 
-    return jsonify({
-        "metadata": {
-            "fuente": "Mercado Público Chile",
-            "fecha_inicio": fecha_inicio_str,
-            "fecha_fin": fecha_fin_str,
-            "total_licitaciones": len(licitaciones),
-            "generado_en": datetime.now().isoformat(),
-        },
-        "licitaciones": licitaciones,
-    }), 200
+    return send_file(
+        ruta_excel,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=nombre_descarga,
+    )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"🚀 Servidor en puerto {port}")
+    logger.info(f"Servidor en puerto {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
