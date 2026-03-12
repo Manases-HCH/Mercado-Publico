@@ -515,39 +515,28 @@ class MercadoPublicoScraper:
             return []
 
         # ── 4. Fecha DESDE ─────────────────────────────────────────────────────
-        logger.info(f"📝 Fecha desde: {fi_str}")
+        # El sitio en headless trata las fechas como exclusivas (devuelve día anterior).
+        # Sumamos 1 día a ambos campos para que el resultado corresponda al día solicitado.
+        from datetime import timedelta
+        fi_str_ajustada = (fecha_inicio + timedelta(days=1)).strftime("%d/%m/%Y")
+        ff_str_ajustada = (fecha_fin    + timedelta(days=1)).strftime("%d/%m/%Y")
+        logger.info(f"📝 Fecha desde: {fi_str} → seteando {fi_str_ajustada} (+1 día)")
         try:
             campo_desde = self._wait(15).until(
                 EC.presence_of_element_located((By.ID, "fechadesde"))
             )
-            logger.info(f"   Valor en DOM antes: '{campo_desde.get_attribute('value')}'")
-            self._js_set_date(campo_desde, fi_str)
-            valor_post = campo_desde.get_attribute("value")
-            logger.info(f"   Valor en DOM después: '{valor_post}'")
-            if valor_post != fi_str:
-                logger.warning(f"   ⚠️  Campo no tomó el valor — reintentando")
-                sleep(1)
-                self._js_set_date(campo_desde, fi_str)
-                logger.info(f"   Valor tras reintento: '{campo_desde.get_attribute('value')}'")
+            self._js_set_date(campo_desde, fi_str_ajustada)
         except TimeoutException:
             logger.error("❌ No se encontró #fechadesde")
             return []
 
         # ── 5. Fecha HASTA ─────────────────────────────────────────────────────
-        logger.info(f"📝 Fecha hasta: {ff_str}")
+        logger.info(f"📝 Fecha hasta: {ff_str} → seteando {ff_str_ajustada} (+1 día)")
         try:
             campo_hasta = self._wait(15).until(
                 EC.presence_of_element_located((By.ID, "fechahasta"))
             )
-            logger.info(f"   Valor actual en DOM antes: '{campo_hasta.get_attribute('value')}'")
-            self._js_set_date(campo_hasta, ff_str)
-            valor_post = campo_hasta.get_attribute("value")
-            logger.info(f"   Valor actual en DOM después: '{valor_post}'")
-            if valor_post != ff_str:
-                logger.warning(f"   ⚠️  El campo NO tomó el valor esperado ({ff_str}) — reintentando")
-                sleep(1)
-                self._js_set_date(campo_hasta, ff_str)
-                logger.info(f"   Valor tras reintento: '{campo_hasta.get_attribute('value')}'")
+            self._js_set_date(campo_hasta, ff_str_ajustada)
         except TimeoutException:
             logger.error("❌ No se encontró #fechahasta")
             return []
