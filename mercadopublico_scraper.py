@@ -89,14 +89,148 @@ class MercadoPublicoScraper:
         self.driver.execute_script("arguments[0].click();", element)
 
     def _js_set_date(self, element, value: str):
-        self.driver.execute_script("arguments[0].removeAttribute('readonly');", element)
-        self.driver.execute_script("arguments[0].value = '';", element)
-        self.driver.execute_script("arguments[0].value = arguments[1];", element, value)
-        for event in ["input", "change", "blur", "keyup"]:
+        """
+        Setea fecha en el datepicker. Estrategia por orden:
+        1. jQuery datepicker('setDate') — funciona en headless/Cloud Run
+        2. JS directo (value + eventos) — fallback
+        3. Navegación del calendario — último recurso
+        value formato: DD/MM/YYYY
+        """
+        dia, mes, anio = int(value[:2]), int(value[3:5]), int(value[6:])
+        field_id = element.get_attribute("id")
+
+        # ── Intento 1: jQuery datepicker API ───────────────────────────────────
+        # Es el más confiable en headless porque respeta todos los handlers internos
+        try:
             self.driver.execute_script(
-                f"arguments[0].dispatchEvent(new Event('{event}', {{bubbles:true}}));", element
+                f"$('#{field_id}').datepicker('setDate', new Date({anio},{mes-1},{dia}));"
+                f"$('#{field_id}').trigger('change');"
             )
-        sleep(0.3)
+            sleep(0.4)
+            valor = element.get_attribute("value")
+            if valor == value:
+                logger.info(f"   ✓ [{field_id}] fecha seteada via jQuery API: {value}")
+                return
+            logger.info(f"   ℹ️  jQuery API dio '{valor}' en vez de '{value}' — probando JS directo")
+        except Exception as e:
+            logger.info(f"   ℹ️  jQuery API falló: {e}")
+
+        # ── Intento 2: JS directo + eventos ───────────────────────────────────
+        try:
+            self.driver.execute_script("arguments[0].removeAttribute('readonly');", element)
+            self.driver.execute_script("arguments[0].removeAttribute('disabled');", element)
+            self.driver.execute_script(f"arguments[0].value = '{value}';", element)
+            for ev in ["input", "change", "blur", "keyup"]:
+                self.driver.execute_script(
+                    f"arguments[0].dispatchEvent(new Event('{ev}', {{bubbles:true}}));", element
+                )
+            sleep(0.4)
+            valor = element.get_attribute("value")
+            if valor == value:
+                logger.info(f"   ✓ [{field_id}] fecha seteada via JS directo: {value}")
+                return
+            logger.info(f"   ℹ️  JS directo dio '{valor}' — probando calendario")
+        except Exception as e:
+            logger.info(f"   ℹ️  JS directo falló: {e}")
+
+        # ── Intento 3: Abrir calendario y navegar ──────────────────────────────
+        try:
+            try:
+                cal_btn = self.driver.find_element(
+                    By.XPATH,
+                    f"//input[@id='{field_id}']/following-sibling::*[contains(@class,'datepicker') "
+                    f"or contains(@class,'calendar') or contains(@class,'ui-datepicker-trigger')]"
+                )
+            except NoSuchElementException:
+                cal_btn = self.driver.find_element(
+                    By.XPATH,
+                    f"//input[@id='{field_id}']/following-sibling::span | "
+                    f"//input[@id='{field_id}']/following-sibling::img | "
+                    f"//input[@id='{field_id}']/following-sibling::button"
+                )
+            self._js_click(cal_btn)
+            sleep(0.8)
+            self._navegar_datepicker(dia, mes, anio)
+            valor = element.get_attribute("value")
+            logger.info(f"   ✓ [{field_id}] tras calendario: '{valor}'")
+        except Exception as e:
+            logger.error(f"   ❌ [{field_id}] todos los métodos fallaron: {e}")
+
+    def _navegar_datepicker(self, dia: int, mes: int, anio: int):
+        """
+        Navega el datepicker jQuery UI hasta el mes/año correcto y hace clic en el día.
+        Asume que el datepicker ya está abierto.
+        """
+        from selenium.webdriver.common.by import By
+
+        # Esperar que el datepicker sea visible
+        try:
+            picker = WebDriverWait(self.driver, 5).until(
+                EC.visibility_of_element_located((By.ID, "ui-datepicker-div"))
+            )
+        except TimeoutException:
+            logger.warning("   ⚠️  Datepicker div no encontrado")
+            return
+
+        # Leer mes/año actual del picker
+        for _ in range(24):  # máximo 24 clics de navegación
+            try:
+                header_mes = self.driver.find_element(
+                    By.CSS_SELECTOR, "#ui-datepicker-div .ui-datepicker-month"
+                )
+                header_anio = self.driver.find_element(
+                    By.CSS_SELECTOR, "#ui-datepicker-div .ui-datepicker-year"
+                )
+                # Pueden ser <select> o texto plano
+                try:
+                    from selenium.webdriver.support.ui import Select as SeleniumSelect
+                    mes_actual  = int(SeleniumSelect(header_mes).first_selected_option.get_attribute("value")) + 1
+                    anio_actual = int(SeleniumSelect(header_anio).first_selected_option.get_attribute("value"))
+                except Exception:
+                    mes_actual  = self._mes_nombre_a_num(header_mes.text)
+                    anio_actual = int(header_anio.text)
+
+                if mes_actual == mes and anio_actual == anio:
+                    break
+
+                # Decidir dirección
+                if (anio_actual, mes_actual) < (anio, mes):
+                    btn = self.driver.find_element(By.CSS_SELECTOR, "#ui-datepicker-div .ui-datepicker-next")
+                else:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, "#ui-datepicker-div .ui-datepicker-prev")
+
+                self._js_click(btn)
+                sleep(0.4)
+
+            except Exception as e:
+                logger.warning(f"   ⚠️  Error navegando datepicker: {e}")
+                break
+
+        # Hacer clic en el día correcto
+        try:
+            dias = self.driver.find_elements(
+                By.XPATH,
+                f"//div[@id='ui-datepicker-div']//td[@data-handler='selectDay']/a[text()='{dia}']"
+            )
+            if dias:
+                self._js_click(dias[0])
+                sleep(0.3)
+                logger.info(f"   ✓ Día {dia} seleccionado en el calendario")
+            else:
+                logger.warning(f"   ⚠️  No se encontró el día {dia} en el calendario")
+        except Exception as e:
+            logger.warning(f"   ⚠️  Error seleccionando día: {e}")
+
+    def _mes_nombre_a_num(self, nombre: str) -> int:
+        meses = {
+            "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+            "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+            "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+            "january": 1, "february": 2, "march": 3, "april": 4,
+            "may": 5, "june": 6, "july": 7, "august": 8,
+            "september": 9, "october": 10, "november": 11, "december": 12,
+        }
+        return meses.get(nombre.lower().strip(), 1)
 
     def _cerrar_popup(self):
         selectores = [
@@ -386,7 +520,15 @@ class MercadoPublicoScraper:
             campo_desde = self._wait(15).until(
                 EC.presence_of_element_located((By.ID, "fechadesde"))
             )
+            logger.info(f"   Valor en DOM antes: '{campo_desde.get_attribute('value')}'")
             self._js_set_date(campo_desde, fi_str)
+            valor_post = campo_desde.get_attribute("value")
+            logger.info(f"   Valor en DOM después: '{valor_post}'")
+            if valor_post != fi_str:
+                logger.warning(f"   ⚠️  Campo no tomó el valor — reintentando")
+                sleep(1)
+                self._js_set_date(campo_desde, fi_str)
+                logger.info(f"   Valor tras reintento: '{campo_desde.get_attribute('value')}'")
         except TimeoutException:
             logger.error("❌ No se encontró #fechadesde")
             return []
@@ -397,7 +539,15 @@ class MercadoPublicoScraper:
             campo_hasta = self._wait(15).until(
                 EC.presence_of_element_located((By.ID, "fechahasta"))
             )
+            logger.info(f"   Valor actual en DOM antes: '{campo_hasta.get_attribute('value')}'")
             self._js_set_date(campo_hasta, ff_str)
+            valor_post = campo_hasta.get_attribute("value")
+            logger.info(f"   Valor actual en DOM después: '{valor_post}'")
+            if valor_post != ff_str:
+                logger.warning(f"   ⚠️  El campo NO tomó el valor esperado ({ff_str}) — reintentando")
+                sleep(1)
+                self._js_set_date(campo_hasta, ff_str)
+                logger.info(f"   Valor tras reintento: '{campo_hasta.get_attribute('value')}'")
         except TimeoutException:
             logger.error("❌ No se encontró #fechahasta")
             return []
@@ -467,6 +617,14 @@ class MercadoPublicoScraper:
             self._ir_siguiente_pagina(pagina_actual)
 
         logger.info(f"\n🎯 Scraping finalizado. Total: {len(todas_licitaciones)} licitaciones")
+
+        # ── Verificar rango real de fechas obtenidas ───────────────────────────
+        fechas = [l.get("fecha_publicacion", "") for l in todas_licitaciones if l.get("fecha_publicacion")]
+        if fechas:
+            logger.info(f"   📅 Fecha más antigua en resultados : {min(fechas)}")
+            logger.info(f"   📅 Fecha más reciente en resultados: {max(fechas)}")
+            logger.info(f"   📅 Rango solicitado                : {fi_str} → {ff_str}")
+
         return todas_licitaciones
 
     # ── Guardar Excel ──────────────────────────────────────────────────────────
